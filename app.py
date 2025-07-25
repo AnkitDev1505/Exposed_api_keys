@@ -1,0 +1,284 @@
+from flask import Flask, render_template_string, request, redirect, url_for
+import csv
+import os
+import os
+import csv
+import re
+import requests
+from flask import Flask, render_template_string, request, redirect, url_for, flash
+from datetime import datetime
+
+app = Flask(__name__)
+app.secret_key = 'supersecret'  # Needed for flash messages
+CSV_FILE = 'exposed_urls.csv'
+
+# --- API Key Regex Patterns ---
+API_KEY_PATTERNS = [
+    # OpenAI
+    r'sk-[A-Za-z0-9\-]{20,}',
+    r'sk-proj-[A-Za-z0-9\-]{20,}',
+    r'sk-svcacct-[A-Za-z0-9\-]{20,}',
+    r'sk-[A-Za-z0-9]{48}',
+    r'Bearer sk-[A-Za-z0-9\-]{20,}',
+    # Google/Gemini
+    r'AIza[0-9A-Za-z\-_]{35,40}',
+    # Anthropic
+    r'sk-ant-api\d{0,2}-[a-zA-Z0-9\-_]{40,120}',
+    r'sk-ant-[a-zA-Z0-9\-_]{40,95}',
+    r'sk-ant-v\d+-[a-zA-Z0-9\-_]{40,95}',
+    r'sk-ant-[a-zA-Z0-9]+-[a-zA-Z0-9\-_]{20,120}',
+    r'sk-ant-[a-zA-Z0-9]{40,64}',
+    r'\bsk-ant-[a-zA-Z0-9\-_]{20,120}\b',
+    # Cohere
+    r'co-[a-zA-Z0-9]{32}',
+    r'\bco[a-zA-Z0-9]{38}\b',
+    # Mistral
+    r'mis_[a-zA-Z0-9]{32,}',
+    # DeepSeek
+    r'sk-[a-zA-Z0-9]{32,48}',
+    r'deepseek-[a-zA-Z0-9]{32,48}',
+    # Perplexity
+    r'pplx-[a-zA-Z0-9]{48,56}',
+    r'pplx-[a-f0-9]{48}',
+    # Replicate
+    r'r8_[a-zA-Z0-9]{24,}',
+    # ElevenLabs
+    r'sk_[a-f0-9]{32}',
+    r'xi-api-key:[a-f0-9]{32}',
+    r'\b[a-f0-9]{32}\b',
+    # HuggingFace
+    r'hf_[a-zA-Z0-9]{34,}',
+]
+
+# --- CSV Storage ---
+def init_csv():
+    if not os.path.exists(CSV_FILE):
+        with open(CSV_FILE, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['url', 'found_at'])
+
+def read_urls():
+    urls = []
+    if os.path.exists(CSV_FILE):
+        with open(CSV_FILE, 'r', newline='', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                urls.append({'url': row['url'], 'found_at': row.get('found_at', '')})
+    # Most recent first
+    return sorted(urls, key=lambda x: x['found_at'], reverse=True)
+
+def add_url(url):
+    # Avoid duplicates
+    urls = [u['url'] for u in read_urls()]
+    if url not in urls:
+        with open(CSV_FILE, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([url, datetime.utcnow().isoformat()])
+        return True
+    return False
+
+# --- GitHub Scanner ---
+GITHUB_API = 'https://api.github.com'
+GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN')
+
+# For demo: scan a few trending repos (or you can hardcode repo list)
+TRENDING_REPOS = [
+    'openai/openai-python',
+    'google/gemini-api',
+    'mistralai/mistral-src',
+    'anthropics/anthropic-sdk',
+    'huggingface/transformers',
+    'cohere-ai/cohere-python',
+    'deepseek-ai/DeepSeek-LLM',
+    'perplexity-ai/pplx',
+    'replicate/replicate',
+    'elevenlabs/elevenlabs-python',
+]
+
+# Helper: get file content from GitHub
+def get_github_file_content(owner, repo, path):
+    url = f'{GITHUB_API}/repos/{owner}/{repo}/contents/{path}'
+    headers = {'Accept': 'application/vnd.github.v3.raw'}
+    if GITHUB_TOKEN:
+        headers['Authorization'] = f'token {GITHUB_TOKEN}'
+    r = requests.get(url, headers=headers)
+    if r.status_code == 200:
+        return r.text
+    return None
+
+# Helper: get repo file tree (only .py, .js, .ts, .env, .json, .yml, .yaml, .txt)
+def get_github_repo_files(owner, repo):
+    url = f'{GITHUB_API}/repos/{owner}/{repo}/git/trees/HEAD?recursive=1'
+    headers = {}
+    if GITHUB_TOKEN:
+        headers['Authorization'] = f'token {GITHUB_TOKEN}'
+    r = requests.get(url, headers=headers)
+    if r.status_code == 200:
+        data = r.json()
+        return [f['path'] for f in data.get('tree', []) if f['type'] == 'blob' and any(f['path'].endswith(ext) for ext in ['.py','.js','.ts','.env','.json','.yml','.yaml','.txt'])]
+    return []
+
+# Main scan function
+def scan_github_repos():
+    found = 0
+    for repo_full in TRENDING_REPOS:
+        owner, repo = repo_full.split('/')
+        files = get_github_repo_files(owner, repo)
+        for file_path in files[:20]:  # Limit to 20 files per repo for demo
+            content = get_github_file_content(owner, repo, file_path)
+            if not content:
+                continue
+            for pattern in API_KEY_PATTERNS:
+                for match in re.findall(pattern, content):
+                    url = f'https://github.com/{owner}/{repo}/blob/HEAD/{file_path}'
+                    if add_url(url):
+                        found += 1
+    return found
+
+# --- HTML Template ---
+TEMPLATE = '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Exposed Repo URLs</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 40px; background: #f9f9f9; }
+        h1 { color: #333; }
+        form { margin-bottom: 20px; }
+        input[type=url] { padding: 8px; width: 300px; }
+        button { padding: 8px 16px; }
+        ul { background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 8px #0001; }
+        li { margin-bottom: 8px; }
+        .scan-btn { background: #007bff; color: #fff; border: none; border-radius: 4px; margin-left: 10px; }
+        .scan-btn:hover { background: #0056b3; }
+        .flash { color: green; margin-bottom: 10px; }
+    </style>
+</head>
+<body>
+    <h1>Exposed Repo URLs</h1>
+    <form method="post" action="/add">
+        <input type="url" name="url" placeholder="Paste repo URL..." required>
+        <button type="submit">Add URL</button>
+        <button type="submit" formaction="/scan" class="scan-btn">Scan Now</button>
+    </form>
+    {% with messages = get_flashed_messages() %}
+      {% if messages %}
+        <div class="flash">{{ messages[0] }}</div>
+      {% endif %}
+    {% endwith %}
+    <ul>
+        {% for item in urls %}
+            <li><a href="{{ item.url }}" target="_blank">{{ item.url }}</a> <small>({{ item.found_at[:19].replace('T',' ') }})</small></li>
+        {% else %}
+            <li>No URLs stored yet.</li>
+        {% endfor %}
+    </ul>
+</body>
+</html>
+'''
+
+@app.route('/')
+def index():
+    urls = read_urls()
+    return render_template_string(TEMPLATE, urls=urls)
+
+@app.route('/add', methods=['POST'])
+def add():
+    url = request.form.get('url')
+    if url:
+        if add_url(url):
+            flash('URL added!')
+        else:
+            flash('URL already exists.')
+    return redirect(url_for('index'))
+
+@app.route('/scan', methods=['POST'])
+def scan():
+    found = scan_github_repos()
+    if found:
+        flash(f'Scan complete! {found} new exposed URLs found.')
+    else:
+        flash('Scan complete! No new exposed URLs found.')
+    return redirect(url_for('index'))
+
+if __name__ == '__main__':
+    init_csv()
+    app.run(debug=True)
+
+
+app = Flask(__name__)
+CSV_FILE = 'exposed_urls.csv'
+
+# Ensure CSV file exists
+def init_csv():
+    if not os.path.exists(CSV_FILE):
+        with open(CSV_FILE, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['url'])
+
+# Read all URLs from CSV
+def read_urls():
+    urls = []
+    if os.path.exists(CSV_FILE):
+        with open(CSV_FILE, 'r', newline='', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                urls.append(row['url'])
+    return urls
+
+# Add a new URL to CSV
+def add_url(url):
+    with open(CSV_FILE, 'a', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow([url])
+
+# HTML template (inline for single file)
+TEMPLATE = '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Exposed Repo URLs</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 40px; background: #f9f9f9; }
+        h1 { color: #333; }
+        form { margin-bottom: 20px; }
+        input[type=url] { padding: 8px; width: 300px; }
+        button { padding: 8px 16px; }
+        ul { background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 8px #0001; }
+        li { margin-bottom: 8px; }
+    </style>
+</head>
+<body>
+    <h1>Exposed Repo URLs</h1>
+    <form method="post" action="/add">
+        <input type="url" name="url" placeholder="Paste repo URL..." required>
+        <button type="submit">Add URL</button>
+    </form>
+    <ul>
+        {% for url in urls %}
+            <li><a href="{{ url }}" target="_blank">{{ url }}</a></li>
+        {% else %}
+            <li>No URLs stored yet.</li>
+        {% endfor %}
+    </ul>
+</body>
+</html>
+'''
+
+@app.route('/')
+def index():
+    urls = read_urls()
+    return render_template_string(TEMPLATE, urls=urls)
+
+@app.route('/add', methods=['POST'])
+def add():
+    url = request.form.get('url')
+    if url:
+        add_url(url)
+    return redirect(url_for('index'))
+
+if __name__ == '__main__':
+    init_csv()
+    app.run(debug=True)
